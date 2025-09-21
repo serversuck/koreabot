@@ -1,4 +1,6 @@
 # 🚀 Koreabot Setup
+## Train yolo model
+https://colab.research.google.com/drive/1F87RuXaNlBXETBa7l-aNEfY9zCkSnZZv?usp=sharing
 
 ## 📦 ติดตั้ง YOLO
 ```bash
