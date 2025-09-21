@@ -26,4 +26,14 @@ catkin_make
 ```
 
 ---
+## 🐢 ตั้งค่าตรวจจับ lane
+```bash
+roslaunch koreabot detect_lane.launch mode:=calibration
+```
 
+---
+## ทดสอบการวิ่งตาม lane
+```bash
+roslaunch koreabot mission.launch
+rostopic pub -1 /mission ... 1
+```
