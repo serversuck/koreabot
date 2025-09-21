@@ -1,0 +1,18 @@
+top_x: 95
+top_y: 67 #40  20
+bottom_x: 139 #140  120
+bottom_y: 114
+
+hue_white_l: 58
+hue_white_h: 179
+saturation_white_l: 146
+saturation_white_h: 255
+lightness_white_l: 0
+lightness_white_h: 109
+
+hue_yellow_l: 62
+hue_yellow_h: 115
+saturation_yellow_l: 67
+saturation_yellow_h: 164
+lightness_yellow_l: 126
+lightness_yellow_h: 184

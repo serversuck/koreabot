@@ -1,0 +1,5 @@
+<launch>
+
+  <node pkg="koreabot" type="control_lane" name="control_lane" output="screen"/>
+
+</launch>

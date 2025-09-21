@@ -1,0 +1,5 @@
+<launch>
+
+  <node pkg="koreabot" type="mission" name="mission" output="screen"/>
+
+</launch>

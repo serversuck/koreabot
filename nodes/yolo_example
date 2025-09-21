@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+import cv2
+import numpy as np
+import rospy
+from sensor_msgs.msg import CompressedImage
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+
+
+class YOLOv11sNode:
+    def __init__(self):
+        rospy.init_node('yolo11s_node')
+        self.bridge = CvBridge()
+        self.model = YOLO("/home/vcs/catkin_ws/src/koreabot/yolo/best.onnx")
+
+        self.sub = rospy.Subscriber("/usb_cam/image_raw/compressed",
+                                    CompressedImage, self.cb_image, queue_size=1)
+        self.conf_threshold = 0.4
+
+        # class id → name
+        self.id2name = {0: "left", 1: "parking", 2: "right"}
+
+    def cb_image(self, msg):
+        np_arr = np.frombuffer(msg.data, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return
+
+        results = self.model(frame, verbose=False)[0]
+
+        for box in results.boxes:
+            conf = float(box.conf.item() if hasattr(box.conf, "item") else box.conf)
+            cls_id = int(box.cls.item() if hasattr(box.cls, "item") else box.cls)
+
+            if conf < self.conf_threshold:
+                continue
+
+            cls_name = self.id2name.get(cls_id, "unknown")
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            # วาดกรอบ + แสดง class name + conf
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, f"{cls_name} {conf:.2f}",
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 255, 0), 2)
+
+        cv2.imshow("YOLOv11s Classes", frame)
+        cv2.waitKey(1)
+
+
+if __name__ == "__main__":
+    node = YOLOv11sNode()
+    rospy.spin()
+    cv2.destroyAllWindows()

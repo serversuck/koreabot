@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+import rospy
+from std_msgs.msg import Bool, String
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+import actionlib
+from actionlib_msgs.msg import GoalStatus
+
+class MissionControl:
+    def __init__(self):
+        rospy.init_node('Tunnelmission', anonymous=True)
+        self.client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
+        rospy.loginfo("Waiting for move_base action server...")
+        self.client.wait_for_server()
+        rospy.loginfo("Connected to move_base action server.")
+        
+        self.waypoints = {
+            "A": (-0.5, -0.6, 0.0, 0.0, 0.68, 0.82),
+            "B": (0.62, 1.25, 0.0, 0.0, 0.99, 0.01),
+            "C": (0.23,1.09, 0.0, 0.0, -0.91, 0.40),
+            "D": (0.05,0.6, 0.0, 0.0, -0.94, 0.32),
+            "E": (-0.70,1.05, 0.0, 0.0, -0.67, 0.73),
+            "F": (-0.69,0.30, 0.0, 0.0, -0.76, 0.64)
+
+        }
+
+        self.start_mission()
+
+    def send_goal(self, name):
+        if name not in self.waypoints:
+            rospy.logwarn(f"Waypoint '{name}' not found.")
+            return False
+        
+        position = self.waypoints[name]
+        goal = MoveBaseGoal()
+        goal.target_pose.header.frame_id = "map"
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.pose.position.x = position[0]
+        goal.target_pose.pose.position.y = position[1]
+        goal.target_pose.pose.orientation.x = position[2]
+        goal.target_pose.pose.orientation.y = position[3]
+        goal.target_pose.pose.orientation.z = position[4]
+        goal.target_pose.pose.orientation.w = position[5]
+
+        rospy.loginfo(f"Sending goal: {name}")
+        self.client.send_goal(goal)
+        self.client.wait_for_result()
+
+        result = self.client.get_state()
+        if result == GoalStatus.SUCCEEDED:
+            rospy.loginfo(f"Reached waypoint: {name}")
+            return True
+        else:
+            rospy.logwarn(f"Failed to reach waypoint: {name}")
+            return False
+
+    def start_mission(self):
+        # เนเธเธขเธฑเธเธเธธเธ” A
+        self.send_goal("A")
+        rospy.sleep(3)
+        
+
+
+if __name__ == '__main__':
+    try:
+        MissionControl()
+        # rospy.spin() เนเธกเนเธเธณเน€เธเนเธ เน€เธเธฃเธฒเธฐเนเธกเนเธกเธต subscriber
+    except rospy.ROSInterruptException:
+        rospy.loginfo("Mission interrupted.")

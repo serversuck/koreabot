@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import math
+import numpy as np
+import cv2
+import rospy
+
+from std_msgs.msg import UInt8, Float64, Bool
+from sensor_msgs.msg import CompressedImage
+from cv_bridge import CvBridge
+from dynamic_reconfigure.server import Server
+from detect.cfg import DetectLaneParamsConfig
+
+# ===== Tunables / constants (รวบไว้ที่เดียว) =====
+WARP_W, WARP_H = 1000, 600
+ROI_CX, ROI_TOP_Y, ROI_BOTTOM_Y = 160, 180, 120
+DRAW_THICK = 25
+CENTER_LINE_THICK = 12
+WHITE_MIN_PIX = 3000
+YELLOW_MIN_PIX = 3000
+TRACK_MIN_PIX = 50
+MARGIN_TRACK = 50
+MARGIN_FIT = 150
+N_WINDOWS = 20
+MOV_AVG_LENGTH = 5
+RELIABLE_THRESH = 50
+RELIABILITY_STEP = 5
+RELIABILITY_MAX = 100
+RELIABILITY_MIN = 0
+LIGHT_LOWER_MIN, LIGHT_LOWER_MAX = 50, 250
+ADAPT_PIX_HIGH, ADAPT_PIX_LOW = 30000, 5000
+
+class DetectLane:
+    def __init__(self):
+        cv2.setUseOptimized(True)
+
+        # ---- params ----
+        self.top_x = rospy.get_param("~top_x", 0)
+        self.top_y = rospy.get_param("~top_y", 0)
+        self.bottom_x = rospy.get_param("~bottom_x", 0)
+        self.bottom_y = rospy.get_param("~bottom_y", 0)
+
+        self.hue_white_l = rospy.get_param("~hue_white_l", 0)
+        self.hue_white_h = rospy.get_param("~hue_white_h", 180)
+        self.saturation_white_l = rospy.get_param("~saturation_white_l", 0)
+        self.saturation_white_h = rospy.get_param("~saturation_white_h", 255)
+        self.lightness_white_l = rospy.get_param("~lightness_white_l", 200)
+        self.lightness_white_h = rospy.get_param("~lightness_white_h", 255)
+        self.reliability_white_line = 100
+
+        self.hue_yellow_l = rospy.get_param("~hue_yellow_l", 15)
+        self.hue_yellow_h = rospy.get_param("~hue_yellow_h", 40)
+        self.saturation_yellow_l = rospy.get_param("~saturation_yellow_l", 40)
+        self.saturation_yellow_h = rospy.get_param("~saturation_yellow_h", 255)
+        self.lightness_yellow_l = rospy.get_param("~lightness_yellow_l", 150)
+        self.lightness_yellow_h = rospy.get_param("~lightness_yellow_h", 255)
+        self.reliability_yellow_line = 100
+
+        self.calibration_mode = rospy.get_param("~calibration_mode", False)
+        self.frame_skip = max(1, int(rospy.get_param("~frame_skip", 1)))  # CHANGE: ทำ throttling แบบ configurable
+        self.counter = 0
+
+        # ---- pubs (ตามโค้ดเดิม) ----
+        if self.calibration_mode:
+            Server(DetectLaneParamsConfig, self.cbGetDetectLaneParam)
+            self.pub_calib = rospy.Publisher('/detect/lane/image_calib/compressed', CompressedImage, queue_size=1)
+            self.pub_projected = rospy.Publisher('/detect/lane/image_projected/compressed', CompressedImage, queue_size=1)
+            self.pub_white_lane = rospy.Publisher('/detect/lane/image_white/compressed', CompressedImage, queue_size=1)
+            self.pub_yellow_lane = rospy.Publisher('/detect/lane/image_yellow/compressed', CompressedImage, queue_size=1)
+
+        self.pub_lane = rospy.Publisher('/detect/lane/compressed', CompressedImage, queue_size=1)
+        self.pub_lane_center = rospy.Publisher('/control/lane', Float64, queue_size=1)
+
+        # ---- subs (ตามโค้ดเดิม) ----
+        rospy.Subscriber('/detect/lane_bot_x', UInt8, self.cbBotX, queue_size=1)
+        rospy.Subscriber('/detect/lane_top_y', UInt8, self.cbTopY, queue_size=1)
+        rospy.Subscriber('/image_input', CompressedImage, self.cbImageProjection, queue_size=1)
+        rospy.Subscriber('/detect/lane_toggle', Bool, self.cbLaneToggle, queue_size=1)
+        rospy.Subscriber('/detect/white_toggle', Bool, self.cbWhiteToggle, queue_size=1)
+        rospy.Subscriber('/detect/yellow_toggle', Bool, self.cbYellowToggle, queue_size=1)
+
+        # ---- states / helpers ----
+        self.cvBridge = CvBridge()
+        self.lane_toggle = True
+        self.white_toggle = True
+        self.yellow_toggle = True
+
+        # CHANGE: init ทุก attr ที่ถูกใช้ภายหลัง กัน AttributeError
+        self.left_fit = np.array([0.0, 0.0, 0.0])
+        self.right_fit = np.array([0.0, 0.0, 0.0])
+        self.left_fitx = np.zeros(WARP_H, dtype=np.float32)
+        self.right_fitx = np.zeros(WARP_H, dtype=np.float32)
+        self.mov_avg_left = np.zeros((0, 3), dtype=np.float32)
+        self.mov_avg_right = np.zeros((0, 3), dtype=np.float32)
+        self.lane_fit_bef = np.array([0.0, 0.0, 0.0])
+        self.is_center_x_exist = False
+
+    # ---------- toggles & params ----------
+    def cbWhiteToggle(self, msg):  self.white_toggle = bool(msg.data)
+    def cbYellowToggle(self, msg): self.yellow_toggle = bool(msg.data)
+    def cbBotX(self, msg):         self.bottom_x = int(msg.data)
+    def cbTopY(self, msg):         self.top_y = int(msg.data)
+    def cbLaneToggle(self, msg):   self.lane_toggle = bool(msg.data)
+
+    def cbGetDetectLaneParam(self, config, level):
+        # sync dynreconf → fields
+        self.top_x, self.top_y = config.top_x, config.top_y
+        self.bottom_x, self.bottom_y = config.bottom_x, config.bottom_y
+
+        self.hue_white_l, self.hue_white_h = config.hue_white_l, config.hue_white_h
+        self.saturation_white_l, self.saturation_white_h = config.saturation_white_l, config.saturation_white_h
+        self.lightness_white_l, self.lightness_white_h = config.lightness_white_l, config.lightness_white_h
+
+        self.hue_yellow_l, self.hue_yellow_h = config.hue_yellow_l, config.hue_yellow_h
+        self.saturation_yellow_l, self.saturation_yellow_h = config.saturation_yellow_l, config.saturation_yellow_h
+        self.lightness_yellow_l, self.lightness_yellow_h = config.lightness_yellow_l, config.lightness_yellow_h
+        return config
+
+    # ---------- core pipeline ----------
+    def cbImageProjection(self, msg_img):
+        # frame skip (ถ้าต้องการ) — ไม่ตัด logic เดิม แต่อยู่ใน param
+        self.counter = (self.counter + 1) % self.frame_skip
+        if self.counter != 0:
+            return
+
+        # decode compressed
+        np_image_original = np.frombuffer(msg_img.data, np.uint8)
+        cv_image_original = cv2.imdecode(np_image_original, cv2.IMREAD_COLOR)
+        if cv_image_original is None:
+            rospy.logwarn_throttle(2.0, "decode failed")
+            return
+
+        # draw ROI in calib mode
+        if self.calibration_mode:
+            cv_image_calib = cv_image_original.copy()
+            tx, ty, bx, by = self.top_x, self.top_y, self.bottom_x, self.bottom_y
+            cv2.line(cv_image_calib, (ROI_CX - tx, ROI_TOP_Y - ty), (ROI_CX + tx, ROI_TOP_Y - ty), (0, 0, 255), 1)
+            cv2.line(cv_image_calib, (ROI_CX - bx, ROI_BOTTOM_Y + by), (ROI_CX + bx, ROI_BOTTOM_Y + by), (0, 0, 255), 1)
+            cv2.line(cv_image_calib, (ROI_CX + bx, ROI_BOTTOM_Y + by), (ROI_CX + tx, ROI_TOP_Y - ty), (0, 0, 255), 1)
+            cv2.line(cv_image_calib, (ROI_CX - bx, ROI_BOTTOM_Y + by), (ROI_CX - tx, ROI_TOP_Y - ty), (0, 0, 255), 1)
+            self.pub_calib.publish(self.cvBridge.cv2_to_compressed_imgmsg(cv_image_calib, "jpg"))
+
+        # blur
+        cv_image_blur = cv2.GaussianBlur(cv_image_original, (5, 5), 0)
+
+        # homography
+        pts_src = np.array([
+            [ROI_CX - self.top_x,    ROI_TOP_Y - self.top_y],
+            [ROI_CX + self.top_x,    ROI_TOP_Y - self.top_y],
+            [ROI_CX + self.bottom_x, ROI_BOTTOM_Y + self.bottom_y],
+            [ROI_CX - self.bottom_x, ROI_BOTTOM_Y + self.bottom_y]
+        ], dtype=np.float32)
+        pts_dst = np.array([[200, 0], [800, 0], [800, WARP_H], [200, WARP_H]], dtype=np.float32)
+
+        if not self._valid_quad(pts_src):
+            rospy.logwarn_throttle(2.0, "invalid ROI for homography")
+            return
+
+        h, status = cv2.findHomography(pts_src, pts_dst)
+        if h is None:
+            rospy.logwarn_throttle(2.0, "findHomography failed")
+            return
+
+        cv_image_homography = cv2.warpPerspective(cv_image_blur, h, (WARP_W, WARP_H))
+
+        # mask side triangles (ตามเดิม)
+        triangle1 = np.array([[0, WARP_H-1], [0, 340], [200, WARP_H-1]], np.int32)
+        triangle2 = np.array([[WARP_W-1, WARP_H-1], [WARP_W-1, 340], [800, WARP_H-1]], np.int32)
+        cv_image_homography = cv2.fillPoly(cv_image_homography, [triangle1, triangle2], (0, 0, 0))
+
+        if self.calibration_mode:
+            self.pub_projected.publish(self.cvBridge.cv2_to_compressed_imgmsg(cv_image_homography, "jpg"))
+
+        # lane masks
+        cv_lane = cv_image_homography.copy()
+        white_fraction, mask_white = self.maskWhiteLane(cv_lane)
+        yellow_fraction, mask_yellow = self.maskYellowLane(cv_lane)
+
+        # fit update (กันพัง + moving average)
+        self._update_fit_from_masks(mask_yellow, yellow_fraction, side='left')
+        self._update_fit_from_masks(mask_white,  white_fraction,  side='right')
+
+        self._apply_moving_average()
+
+        # draw and publish
+        self.make_lane(cv_lane, white_fraction, yellow_fraction)
+
+    # ---------- masking ----------
+    def maskWhiteLane(self, image):
+        return self._mask_color_range(
+            image,
+            (self.hue_white_l, self.saturation_white_l, self.lightness_white_l),
+            (self.hue_white_h, self.saturation_white_h, self.lightness_white_h),
+            adjust_attr='lightness_white_l',
+            pub=self.pub_white_lane if self.calibration_mode else None,
+            reliability_name='reliability_white_line'
+        )
+
+    def maskYellowLane(self, image):
+        return self._mask_color_range(
+            image,
+            (self.hue_yellow_l, self.saturation_yellow_l, self.lightness_yellow_l),
+            (self.hue_yellow_h, self.saturation_yellow_h, self.lightness_yellow_h),
+            adjust_attr='lightness_yellow_l',
+            pub=self.pub_yellow_lane if self.calibration_mode else None,
+            reliability_name='reliability_yellow_line'
+        )
+
+    def _mask_color_range(self, image, lower_tup, upper_tup, adjust_attr, pub, reliability_name):
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        lower = np.array(lower_tup, dtype=np.uint8)
+        upper = np.array(upper_tup, dtype=np.uint8)
+
+        mask = cv2.inRange(hsv, lower, upper)
+        # NOTE: bitwise_and ถูกทิ้งผลลัพธ์ไว้เหมือนเดิมตามโค้ดเดิม
+
+        fraction_num = int(np.count_nonzero(mask))
+
+        # auto adjust lightness lower (แบบเดิมแต่ clamp)
+        val = getattr(self, adjust_attr)
+        if fraction_num > ADAPT_PIX_HIGH and val < LIGHT_LOWER_MAX:
+            setattr(self, adjust_attr, min(LIGHT_LOWER_MAX, val + 5))
+        elif fraction_num < ADAPT_PIX_LOW and val > LIGHT_LOWER_MIN:
+            setattr(self, adjust_attr, max(LIGHT_LOWER_MIN, val - 5))
+
+        # reliability heuristic (แบบเดิม)
+        rows_nonzero = np.count_nonzero(np.any(mask > 0, axis=1))
+        how_much_short = WARP_H - rows_nonzero
+        rel = getattr(self, reliability_name)
+        if how_much_short > 100:
+            rel = max(RELIABILITY_MIN, rel - RELIABILITY_STEP)
+        else:
+            rel = min(RELIABILITY_MAX - 1, rel + RELIABILITY_STEP)
+        setattr(self, reliability_name, rel)
+
+        if pub is not None:
+            pub.publish(self.cvBridge.cv2_to_compressed_imgmsg(mask, "jpg"))
+
+        return fraction_num, mask
+
+    # ---------- fitting ----------
+    def fit_from_lines(self, lane_fit, image):
+        nonzero = image.nonzero()
+        nonzeroy = np.array(nonzero[0])
+        nonzerox = np.array(nonzero[1])
+
+        if lane_fit is None or len(lane_fit) != 3:
+            lane_fit = np.array([0.0, 0.0, float(nonzerox.mean()) if nonzerox.size else 0.0])
+
+        # margin-based indices
+        pred = lane_fit[0] * (nonzeroy ** 2) + lane_fit[1] * nonzeroy + lane_fit[2]
+        lane_inds = (nonzerox > (pred - MARGIN_FIT)) & (nonzerox < (pred + MARGIN_FIT))
+
+        x = nonzerox[lane_inds]
+        y = nonzeroy[lane_inds]
+        if x.size < 50:
+            # fallback: use all nonzero if too sparse
+            x, y = nonzerox, nonzeroy
+
+        lane_fit = np.polyfit(y, x, 2) if x.size >= 3 else lane_fit
+        ploty = np.linspace(0, image.shape[0] - 1, image.shape[0], dtype=np.float32)
+        lane_fitx = lane_fit[0] * ploty ** 2 + lane_fit[1] * ploty + lane_fit[2]
+        return lane_fitx, lane_fit
+
+    def sliding_windown(self, img_w, left_or_right):
+        histogram = np.sum(img_w[int(img_w.shape[0] / 2):, :], axis=0)
+        out_img = np.dstack((img_w, img_w, img_w)) * 255
+        midpoint = int(histogram.shape[0] / 2)
+
+        if left_or_right == 'left':
+            lane_base = int(np.argmax(histogram[:midpoint]))
+        else:
+            lane_base = int(np.argmax(histogram[midpoint:]) + midpoint)
+
+        window_height = int(img_w.shape[0] / N_WINDOWS)
+        nonzero = img_w.nonzero()
+        nonzeroy = np.array(nonzero[0])
+        nonzerox = np.array(nonzero[1])
+        x_current = lane_base
+        lane_inds = []
+
+        for window in range(N_WINDOWS):
+            win_y_low = img_w.shape[0] - (window + 1) * window_height
+            win_y_high = img_w.shape[0] - window * window_height
+            win_x_low = x_current - MARGIN_TRACK
+            win_x_high = x_current + MARGIN_TRACK
+
+            cv2.rectangle(out_img, (win_x_low, win_y_low), (win_x_high, win_y_high), (0, 255, 0), 2)
+
+            good_lane_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                              (nonzerox >= win_x_low) & (nonzerox < win_x_high)).nonzero()[0]
+            lane_inds.append(good_lane_inds)
+            if len(good_lane_inds) > TRACK_MIN_PIX:
+                x_current = int(np.mean(nonzerox[good_lane_inds]))
+
+        if len(lane_inds) == 0:
+            lane_inds = np.array([], dtype=np.intp)
+        else:
+            lane_inds = np.concatenate(lane_inds)
+
+        x = nonzerox[lane_inds] if lane_inds.size else nonzerox
+        y = nonzeroy[lane_inds] if lane_inds.size else nonzeroy
+
+        try:
+            lane_fit = np.polyfit(y, x, 2) if x.size >= 3 else self.lane_fit_bef
+            self.lane_fit_bef = lane_fit
+        except Exception:
+            lane_fit = self.lane_fit_bef
+
+        ploty = np.linspace(0, img_w.shape[0] - 1, img_w.shape[0], dtype=np.float32)
+        lane_fitx = lane_fit[0] * ploty ** 2 + lane_fit[1] * ploty + lane_fit[2]
+        return lane_fitx, lane_fit
+
+    def _update_fit_from_masks(self, mask, fraction, side='left'):
+        try:
+            if side == 'left' and fraction > 4000:
+                self.left_fitx, self.left_fit = self.fit_from_lines(self.left_fit, mask)
+                self.mov_avg_left = np.append(self.mov_avg_left, np.array([self.left_fit]), axis=0)
+            elif side == 'right' and fraction > 4000:
+                self.right_fitx, self.right_fit = self.fit_from_lines(self.right_fit, mask)
+                self.mov_avg_right = np.append(self.mov_avg_right, np.array([self.right_fit]), axis=0)
+        except Exception:
+            # fallback to sliding window
+            if side == 'left' and fraction > 4000:
+                self.left_fitx, self.left_fit = self.sliding_windown(mask, 'left')
+                self.mov_avg_left = np.array([self.left_fit])
+            if side == 'right' and fraction > 4000:
+                self.right_fitx, self.right_fit = self.sliding_windown(mask, 'right')
+                self.mov_avg_right = np.array([self.right_fit])
+
+    def _apply_moving_average(self):
+        # smooth left
+        if self.mov_avg_left.size:
+            L = self.mov_avg_left[::-1][:MOV_AVG_LENGTH]
+            self.left_fit = np.array([np.mean(L[:, 0]), np.mean(L[:, 1]), np.mean(L[:, 2])], dtype=np.float32)
+            if self.mov_avg_left.shape[0] > 1000:
+                self.mov_avg_left = self.mov_avg_left[:MOV_AVG_LENGTH]
+
+        # smooth right
+        if self.mov_avg_right.size:
+            R = self.mov_avg_right[::-1][:MOV_AVG_LENGTH]
+            self.right_fit = np.array([np.mean(R[:, 0]), np.mean(R[:, 1]), np.mean(R[:, 2])], dtype=np.float32)
+            if self.mov_avg_right.shape[0] > 1000:
+                self.mov_avg_right = self.mov_avg_right[:MOV_AVG_LENGTH]
+
+    # ---------- rendering & output ----------
+    def make_lane(self, cv_image, white_fraction, yellow_fraction):
+        warp_zero = np.zeros((cv_image.shape[0], cv_image.shape[1], 1), dtype=np.uint8)
+        color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
+        color_warp_lines = np.dstack((warp_zero, warp_zero, warp_zero))
+        ploty = np.linspace(0, cv_image.shape[0] - 1, cv_image.shape[0], dtype=np.float32)
+
+        pts_left = None
+        pts_right = None
+        if yellow_fraction > YELLOW_MIN_PIX:
+            pts_left = np.array([np.flipud(np.transpose(np.vstack([self.left_fitx, ploty])))])
+            cv2.polylines(color_warp_lines, np.int32([pts_left]), isClosed=False, color=(0, 0, 255), thickness=DRAW_THICK)
+        if white_fraction > WHITE_MIN_PIX:
+            pts_right = np.array([np.transpose(np.vstack([self.right_fitx, ploty]))])
+            cv2.polylines(color_warp_lines, np.int32([pts_right]), isClosed=False, color=(255, 255, 0), thickness=DRAW_THICK)
+
+        # toggle → reliability
+        if not self.white_toggle:  self.reliability_white_line = 0
+        if not self.yellow_toggle: self.reliability_yellow_line = 0
+
+        centerx = None
+        self.is_center_x_exist = True
+
+        if self.reliability_white_line > RELIABLE_THRESH and self.reliability_yellow_line > RELIABLE_THRESH:
+            if pts_left is not None and pts_right is not None:
+                centerx = np.mean([self.left_fitx, self.right_fitx], axis=0)
+                pts = np.hstack((pts_left, pts_right))
+                pts_center = np.array([np.transpose(np.vstack([centerx, ploty]))])
+                cv2.polylines(color_warp_lines, np.int32([pts_center]), False, (0, 255, 255), CENTER_LINE_THICK)
+                cv2.fillPoly(color_warp, np.int32([pts]), (0, 255, 0))
+            elif pts_right is not None:
+                centerx = self.right_fitx - 320
+                pts_center = np.array([np.transpose(np.vstack([centerx, ploty]))])
+                cv2.polylines(color_warp_lines, np.int32([pts_center]), False, (0, 255, 255), CENTER_LINE_THICK)
+            elif pts_left is not None:
+                centerx = self.left_fitx + 320
+                pts_center = np.array([np.transpose(np.vstack([centerx, ploty]))])
+                cv2.polylines(color_warp_lines, np.int32([pts_center]), False, (0, 255, 255), CENTER_LINE_THICK)
+            else:
+                self.is_center_x_exist = False
+        elif self.reliability_white_line <= RELIABLE_THRESH and self.reliability_yellow_line > RELIABLE_THRESH and pts_left is not None:
+            centerx = self.left_fitx + 260
+            pts_center = np.array([np.transpose(np.vstack([centerx, ploty]))])
+            cv2.polylines(color_warp_lines, np.int32([pts_center]), False, (0, 255, 255), CENTER_LINE_THICK)
+        elif self.reliability_white_line > RELIABLE_THRESH and self.reliability_yellow_line <= RELIABLE_THRESH and pts_right is not None:
+            centerx = self.right_fitx - 260
+            pts_center = np.array([np.transpose(np.vstack([centerx, ploty]))])
+            cv2.polylines(color_warp_lines, np.int32([pts_center]), False, (0, 255, 255), CENTER_LINE_THICK)
+        else:
+            self.is_center_x_exist = False  # TODO: stop/hold
+
+        final = cv2.addWeighted(cv_image, 1.0, color_warp, 0.2, 0)
+        final = cv2.addWeighted(final, 1.0, color_warp_lines, 1.0, 0)
+
+        # publish center (ปลอดภัยขึ้น)
+        if self.is_center_x_exist and centerx is not None and centerx.size > 351:
+            center_idx = min(350, centerx.size - 1)
+            cx = float(centerx[center_idx])
+            if np.isfinite(cx) and self.lane_toggle:
+                msg_desired_center = Float64()
+                msg_desired_center.data = cx
+                self.pub_lane_center.publish(msg_desired_center)
+
+        self.pub_lane.publish(self.cvBridge.cv2_to_compressed_imgmsg(final, "jpg"))
+
+    # ---------- utils ----------
+    @staticmethod
+    def _valid_quad(pts):
+        # ป้องกันเส้นไขว้หรือ side ยาว 0
+        if pts.shape != (4, 2):
+            return False
+        a = np.linalg.norm(pts[0] - pts[1]) * np.linalg.norm(pts[2] - pts[3])
+        b = np.linalg.norm(pts[1] - pts[2]) * np.linalg.norm(pts[3] - pts[0])
+        return a > 1e-3 and b > 1e-3
+
+    def main(self):
+        rospy.spin()
+
+if __name__ == '__main__':
+    rospy.init_node('detect_lane')
+    node = DetectLane()
+    node.main()
