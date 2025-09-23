@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import math
 import cv2
 import numpy as np
-import rospy
-from cv_bridge import CvBridge
+import rospy , math
 from sensor_msgs.msg import CompressedImage
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, String
 from ultralytics import YOLO
+import tf.transformations as tft
+
 
 
 class IntersectionWatcher:
@@ -17,50 +17,51 @@ class IntersectionWatcher:
         rospy.init_node("intersection_watcher", anonymous=False)
 
         # --- Params ---
-        self.model_path = rospy.get_param("~model_path", "/home/vcs/catkin_ws/src/koreabot/yolo/best.onnx")
-        self.image_topic = rospy.get_param("~image_topic", "/usb_cam/image_raw/compressed")
-        self.odom_topic = rospy.get_param("~odom_topic", "/odom")
-        self.toggle_topic = rospy.get_param("~toggle_topic", "/toggle_lane")
-        self.sign_topic = rospy.get_param("~sign_topic", "/sign_name")
-        self.target_sign = rospy.get_param("~target_sign", "intersection")   # <<< ป้ายที่ต้องจับ
-        self.conf_th = float(rospy.get_param("~conf_th", 0.40))
-        self.dist_th = float(rospy.get_param("~dist_th", 0.30))              # 30 cm
+        self.model_path   = rospy.get_param("~model_path", "/home/vcs/catkin_ws/src/koreabot/yolo/best.onnx")
+        self.image_topic  = rospy.get_param("~image_topic", "/usb_cam/image_raw/compressed")
+        self.odom_topic   = rospy.get_param("~odom_topic", "/odom")
+        self.toggle_topic = rospy.get_param("~toggle_topic", "/detect/lane_toggle")
+        self.sign_topic   = rospy.get_param("~sign_topic", "/sign_name")
+        self.target_sign  = rospy.get_param("~target_sign", "parking")
+        self.conf_th      = float(rospy.get_param("~conf_th", 0.70))
 
-        # class id -> name (ปรับตามโมเดลของ Aj)
-        self.id2name = rospy.get_param("~id2name", { "0":"left", "1":"parking", "2":"right", "3":"intersection" })
-        self.id2name = {int(k): v for k, v in self.id2name.items()}
+        # class id -> name (ปรับตามโมเดล Aj)
+        id2name = rospy.get_param("~id2name", {"0": "left", "1": "parking", "2": "right", "3": "intersection"})
+        self.id2name = {int(k): v for k, v in id2name.items()}
+
+        # เกณฑ์การหมุน
+        self.turn_w_min = float(rospy.get_param("~turn_w_min", 0.4))  # rad/s
+        self.use_abs_w  = bool(rospy.get_param("~use_abs_w", True))
+        self.quat_w_min = float(rospy.get_param("~quat_w_min", 0.2))
+        self.quat_w_max = float(rospy.get_param("~quat_w_max", 0.55))
+        self.use_abs_quat_w = bool(rospy.get_param("~use_abs_quat_w", True))  # ใช้ |w| ดีสุดกันเคส w<0
+        self.cooldown = rospy.Duration(rospy.get_param("~cooldown_s", 0.5))   # ถ้าเคยมีอยู่แล้ว ไม่ต้องเพิ่มซ้ำ
+
 
         # --- Runtime state ---
-        self.bridge = CvBridge()
         self.model = YOLO(self.model_path)
-        self.have_odom = False
-        self.curr_xy = (0.0, 0.0)
-        self.armed = False              # True หลังเจอ intersection แล้วรอระยะ
-        self.start_xy = None            # ตำแหน่งที่เริ่มจับระยะหลังเจอป้าย
-        self.last_fire_time = rospy.Time(0)
-        self.cooldown = rospy.Duration(0.5)  # กันสั่นเล็กน้อย
+        self.armed = False
+        self.last_w_fire_time = rospy.Time(0)
+        self.last_theta = None      
+        self.last_time = None
+
 
         # --- Pub/Sub ---
         self.pub_toggle = rospy.Publisher(self.toggle_topic, Bool, queue_size=1)
-        self.pub_sign = rospy.Publisher(self.sign_topic, String, queue_size=1)
-
+        self.pub_sign   = rospy.Publisher(self.sign_topic,   String, queue_size=1)
         rospy.Subscriber(self.image_topic, CompressedImage, self.cb_image, queue_size=1)
-        rospy.Subscriber(self.odom_topic, Odometry, self.cb_odom, queue_size=20)
+        rospy.Subscriber(self.odom_topic,  Odometry,        self.cb_odom,  queue_size=20)
 
-        rospy.loginfo("IntersectionWatcher ready. target_sign='%s', dist_th=%.2fm",
-                      self.target_sign, self.dist_th)
+        rospy.loginfo("IntersectionWatcher ready. target_sign='%s'", self.target_sign)
 
     # ---------------- Image callback: detect sign ----------------
     def cb_image(self, msg: CompressedImage):
-        np_arr = np.frombuffer(msg.data, np.uint8)
-        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        frame = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             return
 
-        # run model
         res = self.model(frame, verbose=False)[0]
 
-        # check each box
         for b in res.boxes:
             conf = float(b.conf.item() if hasattr(b.conf, "item") else b.conf)
             if conf < self.conf_th:
@@ -68,86 +69,45 @@ class IntersectionWatcher:
 
             cls_id = int(b.cls.item() if hasattr(b.cls, "item") else b.cls)
             cls_name = self.id2name.get(cls_id, "unknown")
-
-            # --- only care about target sign ---
             if cls_name != self.target_sign:
                 continue
 
-            # Debounce: อย่า re-arm ซ้อนกัน หากยัง armed อยู่
             if self.armed:
-                rospy.logdebug_throttle(1.0, "Already armed; ignore further detections.")
                 continue
 
-            # Need odom to start measuring distance
-            if not self.have_odom:
-                rospy.logwarn_throttle(2.0, "Detected '%s' but no /odom yet; waiting...", self.target_sign)
-                continue
-
-            # Arm distance tracking
+            # Arm หลังพบป้ายเป้าหมาย
             self.armed = True
-            self.start_xy = self.curr_xy
             self.pub_sign.publish(String(self.target_sign))
-            rospy.loginfo("Detected '%s' (conf=%.2f). Armed distance tracking at (%.3f, %.3f).",
-                          self.target_sign, conf, self.start_xy[0], self.start_xy[1])
-
-            # วาดกรอบเล็กน้อย (optional)
-            x1, y1, x2, y2 = map(int, b.xyxy[0])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
-            cv2.putText(frame, f"{cls_name} {conf:.2f}",
-                        (x1, max(0, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
-
-            # เจอแล้ว arm ครั้งเดียวพอ
+            rospy.loginfo("Detected '%s' (conf=%.2f). Arm turning check.",
+                          self.target_sign, conf)
             break
 
-        # แสดงภาพได้ถ้าต้องการ (คอมเมนต์ถ้า headless)
-        try:
-            cv2.imshow("intersection_watcher", frame)
-            cv2.waitKey(1)
-        except:
-            pass
-
-    # ---------------- Odom callback: track distance ----------------
+    # ---------------- Odom callback: check turning ----------------
     def cb_odom(self, msg: Odometry):
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
-        self.curr_xy = (x, y)
-        self.have_odom = True
-
-        # ถ้ายังไม่ armed ไม่ต้องคำนวณ
-        if not self.armed or self.start_xy is None:
+        if not self.armed:
             return
 
-        # begin วัดระยะทางที่เดินจากตำแหน่ง sign
-        dx = x - self.start_xy[0]
-        dy = y - self.start_xy[1]
-        dist = math.hypot(dx, dy)
+        # อ่าน quaternion.w จาก odom.pose.pose.orientation.w
+        q = msg.pose.pose.orientation
+        wq = abs(q.w) if self.use_abs_quat_w else q.w
 
-        rospy.logdebug_throttle(0.5, "detected: dist=%.3f / %.3f", dist, self.dist_th)
-
-        # ถึงระยะ → ส่ง false ไป /toggle_lane แล้ว reset
-        if dist >= self.dist_th and (rospy.Time.now() - self.last_fire_time) > self.cooldown:
+        # ถ้า w อยู่ในช่วง [min, max] -> toggle FALSE (พร้อม cooldown)
+        if (self.quat_w_min <= wq <= self.quat_w_max) and \
+        ((rospy.Time.now() - self.last_w_fire_time) > self.cooldown):
             self.pub_toggle.publish(Bool(False))
-            self.last_fire_time = rospy.Time.now()
-            rospy.loginfo("Distance reached (%.3fm). Published False to %s",
-                          dist, self.toggle_topic)
-
-            # send command move robot here
-            
-
-            #
-
-
-
+            self.last_w_fire_time = rospy.Time.now()
+            rospy.logwarn("quat.w in [%.2f, %.2f]: w=%.3f -> toggle FALSE to %s",
+                        self.quat_w_min, self.quat_w_max, wq, self.toggle_topic)
+            # กันยิงรัว ๆ รอบเดียวพอ
             self.armed = False
-            self.start_xy = None
+
+
+
 
 
 if __name__ == "__main__":
     try:
         node = IntersectionWatcher()
         rospy.spin()
-    finally:
-        try:
-            cv2.destroyAllWindows()
-        except:
-            pass
+    except rospy.ROSInterruptException:
+        pass

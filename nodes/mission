@@ -33,8 +33,12 @@ class CoreNodeController():
   
 
         self.launch_Traffic = roslaunch.scriptapi.ROSLaunch()
-        self.launch_Traffic = roslaunch.parent.ROSLaunchParent(self.uuid, [self.ros_package_path + "detect/launch/detect_traffic_light.launch"])
+        self.launch_Traffic = roslaunch.parent.ROSLaunchParent(self.uuid, [self.ros_package_path + "launch/detect_traffic_light.launch"])
         
+        self.launch_Intersection= roslaunch.scriptapi.ROSLaunch()
+        self.launch_Intersection = roslaunch.parent.ROSLaunchParent(self.uuid, [self.ros_package_path + "launch/detect_intersection.launch"])
+        
+
 
         loop_rate = rospy.Rate(10) # 10hz
 
@@ -55,7 +59,14 @@ class CoreNodeController():
             rospy.loginfo(f" Mission Traffic begin")
             self.launch_DetectLane.start()
             self.launch_ControlLane.start()
-            # self.launch_Traffic.start()
+        
+        elif self.current_mode == self.Mission.Intersection.value:
+            rospy.loginfo(f" Mission Intersection begin")
+            self.launch_DetectLane.start()
+            self.launch_ControlLane.start()
+            self.launch_Intersection.start()
+            
+
         elif self.current_mode == self.Mission.Tunnel.value:
             rospy.loginfo(f" Mission Tunnel begin")
             self.launch_DetectLane.shutdown()

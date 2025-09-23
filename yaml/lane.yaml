@@ -1,7 +1,7 @@
-top_x: 95
-top_y: 67 #40  20
-bottom_x: 139 #140  120
-bottom_y: 114
+top_x: 112
+top_y: 62 #40  20
+bottom_x: 147 #140  120
+bottom_y: 109
 
 hue_white_l: 58
 hue_white_h: 179

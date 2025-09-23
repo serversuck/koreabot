@@ -1,0 +1,157 @@
+import rospy
+import tf
+import math
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
+from std_msgs.msg import String
+
+class RobotController:
+    def __init__(self):
+        rospy.init_node('robot_controller')
+        self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
+        rospy.Subscriber('/odom', Odometry, self.cbOdom)
+        rospy.Subscriber('/move_cmd', String, self.cb_move_cmd)
+
+        
+
+        self.current_theta = 0.0
+        self.current_x = 0.0
+        self.current_y = 0.0
+        self.Kp = 1.5
+        self.Kd = 2
+        self.x = 0.0; self.y = 0.0; self.th = 0.0
+        self.kp_lin = 0.8
+        self.kd_lin = 0.0
+        self.speed_fwd_cms = 12  # เดินหน้า
+        self.speed_bk_cms  = 10  # ถอยหลัง
+        self.max_v = 0.17
+        # self.have_odom = False
+        self.rate = rospy.Rate(10)
+
+    def cbOdom(self, msg):
+        self.current_x = msg.pose.pose.position.x
+        self.current_y = msg.pose.pose.position.y
+        orientation_q = msg.pose.pose.orientation
+        _, _, self.current_theta = tf.transformations.euler_from_quaternion([
+            orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w])
+    
+    def cb_move_cmd(self, msg):
+        cmd = msg.data.strip().lower()   # แปลงเป็นตัวเล็กกันพลาด
+        rospy.loginfo(f"Received move_cmd: {cmd}")
+
+        if cmd.startswith("fd"):
+            try:
+                val = float(cmd[2:])  # ตัดตัวเลขหลัง fd
+                self.fd(val)
+            except ValueError:
+                rospy.logwarn(f"Invalid fd command: {cmd}")
+
+        elif cmd.startswith("bk"):
+            try:
+                val = float(cmd[2:])
+                self.bk(val)
+            except ValueError:
+                rospy.logwarn(f"Invalid bk command: {cmd}")
+        elif cmd.startswith("turn"):
+            try:
+                val = float(cmd[4:])
+                num = cmd[4:].rstrip("d")
+                deg = float(num)
+                self.turn_odom(deg)
+            except ValueError:
+                rospy.logwarn(f"Invalid bk command: {cmd}")
+
+        else:
+            rospy.logwarn(f"Unknown command: {cmd}")
+    def turn_odom(self, target_angle):
+        
+        target_theta = self.current_theta + math.radians(target_angle)
+        last_error = 0.0
+        while not rospy.is_shutdown():
+            error = target_theta - self.current_theta
+            if abs(error) < 0.05:
+                break
+            angular_z = self.Kp * error + self.Kd * (error - last_error)
+            last_error = error
+            self.publish_cmd(0.0, angular_z)
+            self.rate.sleep()
+        
+        self.current_theta = 0.0
+        self.stop()
+
+    def move_to(self, target_x, target_y):
+        last_error = 0.0
+        while not rospy.is_shutdown():
+            error_x = target_x - self.current_x
+            error_y = target_y - self.current_y
+            distance = math.sqrt(error_x**2 + error_y**2)
+            if distance < 0.005:
+                break
+            linear_x = self.Kp * distance + self.Kd * (distance - last_error)
+            last_error = distance
+            self.publish_cmd(linear_x, 0.0)
+            self.rate.sleep()
+        self.stop()
+
+    def fd(self, cm, ramp_s=0.2):
+        """เดินหน้าเป็นระยะ cm (ไม่ใช้ odom: คุมด้วยเวลา)"""
+        cm = max(0.0, float(cm)+2)
+        if self.speed_fwd_cms <= 0:
+            rospy.logwarn("speed_fwd_cms <= 0, skip fd")
+            return
+        duration = cm / self.speed_fwd_cms                 # s
+        v_cmd    = min(self.max_v, self.speed_fwd_cms/100.0)  # m/s
+        self._drive_for(duration, v_cmd, ramp_s=ramp_s)
+
+    def bk(self, cm, ramp_s=0.2):
+        """ถอยหลังเป็นระยะ cm (ไม่ใช้ odom: คุมด้วยเวลา)"""
+        cm = max(0.0, float(cm)+2)
+        if self.speed_bk_cms <= 0:
+            rospy.logwarn("speed_bk_cms <= 0, skip bk")
+            return
+        duration = cm / self.speed_bk_cms                  # s
+        v_cmd    = -min(self.max_v, self.speed_bk_cms/100.0)  # m/s (ติดลบ = ถอย)
+        self._drive_for(duration, v_cmd, ramp_s=ramp_s)
+
+
+    def publish_cmd(self, linear_x, angular_z):
+        twist = Twist()
+        twist.linear.x = linear_x
+        twist.angular.z = angular_z
+        self.cmd_vel_pub.publish(twist)
+
+    def stop(self):
+        self.publish_cmd(0.0, 0.0)
+    def _drive_for(self, duration_s, v_target_ms, ramp_s=0.2):
+
+        v_target_ms = max(-self.max_v, min(self.max_v, v_target_ms))
+        start = rospy.Time.now().to_sec()
+        end   = start + max(0.0, duration_s)
+
+        while not rospy.is_shutdown():
+            now = rospy.Time.now().to_sec()
+            if now >= end:
+                break
+
+            scale = 1.0
+            if ramp_s > 0.0:
+                t = now - start
+                if t < ramp_s:
+                    scale = t / ramp_s
+                elif now > end - ramp_s:
+                    scale = max(0.0, (end - now) / ramp_s)
+
+            self.publish_cmd(v_target_ms * scale, 0.0)
+            self.rate.sleep()
+
+        self.stop()
+
+
+if __name__ == '__main__':
+    controller = RobotController()
+    rospy.spin()
+    # controller.turn_odom(10)
+    # controller.turn_odom(90)
+    # controller.bk(10)
+    # controller.bk(10)
+
