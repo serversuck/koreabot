@@ -39,3 +39,14 @@ roslaunch koreabot detect_lane.launch mode:=calibration
 roslaunch koreabot mission.launch
 rostopic pub -1 /mission ... 1
 ```
+## Command สำคัญ
+```bash
+$ rostopic pub -1 /reset std_msgs/Empty  #reset odom
+$rosrun rqt_reconfigure rqt_reconfigure  #setting parameter
+$rostopic pub -1 /detect/white_toggle std_msgs/Bool "data: True"  # ติดตามเส้นสีขาว
+$rostopic pub -1 /detect/yellow_toggle std_msgs/Bool "data: True"  # ติดตามเส้นสีเหลือง
+$rostopic pub -1 /detect/lane_toggle std_msgs/Bool "data: True"  # ติดตามเลน / false หยุดติดตามเลน
+
+
+
+```
